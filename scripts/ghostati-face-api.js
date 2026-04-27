@@ -5,6 +5,24 @@ const MODEL_URLS = {
    ageGender: 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js-models@master/age_gender_model'
 };
 
+const RACE_MODEL = {
+   runtimeUrl: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.0/dist/ort.min.js',
+   wasmPath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.0/dist/',
+   modelUrl: 'models/Race-CLS-FairFace_yolov8n.onnx',
+   timeoutMs: 30000,
+   preloadTimeoutMs: 60000
+};
+// Model metadata: Black, East Asian, Indian, Latino_Hispanic, Middle Eastern, Southeast Asian, White.
+const RACE_LABELS = [
+   'black',
+   'asian',
+   'asian',
+   'latino',
+   'arab',
+   'asian',
+   'white'
+];
+
 const STORAGE_KEY = 'local-face-lab-db-v1';
 const MATCH_THRESHOLD = 0.58;
 const DETECTOR_OPTIONS = new faceapi.TinyFaceDetectorOptions({
@@ -73,6 +91,10 @@ let lastEffectRun = 0;
 let isSystemBusy = false;
 let lastKnownEffectResult = null;
 let lastCompositedCanvas = null;
+let raceSessionPromise = null;
+let raceSessionError = null;
+let raceModelLoadLogged = false;
+let lastRaceModelProgressLog = 0;
 
 function loadDb() {
    try {
@@ -167,6 +189,243 @@ function distance(a, b) {
       sum += d * d;
    }
    return Math.sqrt(sum);
+}
+
+function markerFromScores(scores) {
+   if (!scores || typeof scores !== 'object') return null;
+   let best = null;
+   Object.entries(scores).forEach(([label, score]) => {
+      if (typeof score !== 'number') return;
+      if (!best || score > best.probability) best = { label, probability: score };
+   });
+   return best;
+}
+
+function normalizeRaceMarker(value) {
+   if (!value) return null;
+   if (typeof value === 'string') return { label: value };
+   if (typeof value === 'object') {
+      const label = value.label || value.name || value.className || value.class || value.dominant || value.value;
+      const probability = value.probability ?? value.confidence ?? value.score;
+      if (label) return { label, probability: typeof probability === 'number' ? probability : null };
+      return markerFromScores(value);
+   }
+   return null;
+}
+
+function getRaceMarker(result) {
+   if (!result) return null;
+   return normalizeRaceMarker(result.race)
+      || normalizeRaceMarker(result.dominantRace)
+      || normalizeRaceMarker(result.dominant_race)
+      || normalizeRaceMarker(result.ethnicity)
+      || normalizeRaceMarker(result.dominantEthnicity)
+      || normalizeRaceMarker(result.dominant_ethnicity);
+}
+
+function formatRaceMarker(marker, fallback = 'n/d') {
+   if (!marker || !marker.label) return fallback;
+   if (typeof marker.probability === 'number') {
+      const percentage = marker.probability <= 1 ? marker.probability * 100 : marker.probability;
+      return `${marker.label} (${Math.round(percentage)}%)`;
+   }
+   return marker.label;
+}
+
+function cropFaceForRace(result) {
+   const videoWidth = els.video.videoWidth || els.video.clientWidth || els.video.width;
+   const videoHeight = els.video.videoHeight || els.video.clientHeight || els.video.height;
+   if (!videoWidth || !videoHeight || !result || !result.detection) return null;
+
+   const box = result.detection.box;
+   const sourceDims = result.detection.imageDims || result.detection._imageDims || { width: videoWidth, height: videoHeight };
+   const scaleX = videoWidth / sourceDims.width;
+   const scaleY = videoHeight / sourceDims.height;
+   const centerX = (box.x + box.width / 2) * scaleX;
+   const centerY = (box.y + box.height / 2) * scaleY;
+   const cropSize = Math.max(box.width * scaleX, box.height * scaleY) * 1.35;
+   if (cropSize <= 0) return null;
+
+   const canvas = document.createElement('canvas');
+   canvas.width = 224;
+   canvas.height = 224;
+   const ctx = canvas.getContext('2d');
+   let angle = 0;
+   if (result.landmarks) {
+      const leftEye = avgPoint(result.landmarks.getLeftEye());
+      const rightEye = avgPoint(result.landmarks.getRightEye());
+      const dx = (rightEye.x - leftEye.x) * scaleX;
+      const dy = (rightEye.y - leftEye.y) * scaleY;
+      angle = Math.atan2(dy, dx);
+   }
+
+   const scale = canvas.width / cropSize;
+   ctx.fillStyle = '#000';
+   ctx.fillRect(0, 0, canvas.width, canvas.height);
+   ctx.translate(canvas.width / 2, canvas.height / 2);
+   ctx.scale(scale, scale);
+   ctx.rotate(-angle);
+   ctx.drawImage(els.video, -centerX, -centerY, videoWidth, videoHeight);
+   return canvas;
+}
+
+function loadScriptOnce(url) {
+   return new Promise((resolve, reject) => {
+      const existing = document.querySelector(`script[src="${url}"]`);
+      if (existing) {
+         if (existing.dataset.loaded === 'true') resolve();
+         else {
+            existing.addEventListener('load', () => resolve(), { once: true });
+            existing.addEventListener('error', () => reject(new Error(`impossibile caricare ${url}`)), { once: true });
+         }
+         return;
+      }
+
+      const script = document.createElement('script');
+      script.src = url;
+      script.async = true;
+      script.onload = () => {
+         script.dataset.loaded = 'true';
+         resolve();
+      };
+      script.onerror = () => reject(new Error(`impossibile caricare ${url}`));
+      document.head.appendChild(script);
+   });
+}
+
+function withTimeout(promise, timeoutMs, message) {
+   let timeoutId = null;
+   const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+   });
+   return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
+function logRaceModelProgress(progress) {
+   const now = performance.now();
+   if (now - lastRaceModelProgressLog < 1600) return;
+
+   lastRaceModelProgressLog = now;
+   setLog(progress);
+}
+
+async function loadRaceSession() {
+   if (raceSessionError) throw raceSessionError;
+   if (!raceSessionPromise) {
+      raceSessionPromise = loadScriptOnce(RACE_MODEL.runtimeUrl)
+         .then(async () => {
+            const runtime = window.ort;
+            if (!runtime) throw new Error('onnxruntime-web non disponibile');
+            runtime.env.wasm.wasmPaths = RACE_MODEL.wasmPath;
+            runtime.env.wasm.numThreads = 1;
+            logRaceModelProgress('Race model: download YOLOv8n FairFace ONNX');
+            const response = await fetch(RACE_MODEL.modelUrl);
+            if (!response.ok) throw new Error(`HTTP ${response.status} durante il download YOLOv8n FairFace`);
+            const modelBuffer = await response.arrayBuffer();
+            logRaceModelProgress('Race model: inizializzazione ONNX Runtime');
+            return runtime.InferenceSession.create(modelBuffer, { executionProviders: ['wasm'] });
+         })
+         .catch(err => {
+            raceSessionError = err;
+            raceSessionPromise = null;
+            setTimeout(() => {
+               if (raceSessionError === err) raceSessionError = null;
+            }, 30000);
+            throw err;
+         });
+   }
+   return raceSessionPromise;
+}
+
+async function preloadRaceSession() {
+   try {
+      await withTimeout(loadRaceSession(), RACE_MODEL.preloadTimeoutMs, 'timeout precaricamento modello race');
+      setLog('Modello YOLOv8n FairFace race/ethnicity pronto.');
+   } catch (err) {
+      console.error(err);
+      setLog(`YOLOv8n FairFace race non pronto: ${err.message || err}. Riproverò alla prossima scansione.`);
+   }
+}
+
+function tensorClassPrediction(tensor) {
+   if (!tensor || !tensor.data || tensor.data.length === 0) return null;
+   if (tensor.data.length === 1) return { index: Number(tensor.data[0]), probability: null };
+
+   const raw = Array.from(tensor.data, Number);
+   const hasProbabilities = raw.every(score => score >= 0) && Math.abs(raw.reduce((sum, score) => sum + score, 0) - 1) < 0.05;
+   const scores = hasProbabilities ? raw : softmax(raw);
+   let index = 0;
+   for (let i = 1; i < scores.length; i += 1) {
+      if (scores[i] > scores[index]) index = i;
+   }
+   return { index, probability: scores[index] };
+}
+
+function softmax(values) {
+   const max = Math.max(...values);
+   const exp = values.map(value => Math.exp(value - max));
+   const sum = exp.reduce((total, value) => total + value, 0);
+   return exp.map(value => value / sum);
+}
+
+function getRaceOutputTensor(outputs, outputNames) {
+   const namedRaceOutput = outputNames.find(name => name.toLowerCase().includes('race'));
+   return outputs.race || outputs.race_id || outputs.race_output || outputs[namedRaceOutput] || outputs[outputNames[0]] || Object.values(outputs)[0];
+}
+
+function fairFaceRaceMarker(prediction) {
+   if (!prediction) return null;
+   const label = RACE_LABELS[prediction.index] || null;
+   return label ? { label, probability: prediction.probability } : null;
+}
+
+function fairFaceInputTensor(crop) {
+   const ctx = crop.getContext('2d', { willReadFrequently: true });
+   const pixels = ctx.getImageData(0, 0, crop.width, crop.height).data;
+   const imageSize = crop.width * crop.height;
+   const data = new Float32Array(3 * imageSize);
+
+   for (let i = 0, p = 0; i < imageSize; i += 1, p += 4) {
+      data[i] = pixels[p] / 255;
+      data[imageSize + i] = pixels[p + 1] / 255;
+      data[imageSize * 2 + i] = pixels[p + 2] / 255;
+   }
+
+   return new window.ort.Tensor('float32', data, [1, 3, crop.height, crop.width]);
+}
+
+async function estimateRaceMarker(result) {
+   const existing = getRaceMarker(result);
+   if (existing) return existing;
+
+   const crop = cropFaceForRace(result);
+   if (!crop) return null;
+
+   try {
+      if (!raceModelLoadLogged) {
+         raceModelLoadLogged = true;
+         setLog('Caricamento modello YOLOv8n FairFace race/ethnicity in corso. La prima scansione può richiedere qualche secondo.');
+      }
+      const session = await withTimeout(loadRaceSession(), RACE_MODEL.timeoutMs, 'timeout caricamento modello race');
+      const inputName = session.inputNames[0] || 'input';
+      const outputs = await withTimeout(
+         session.run({ [inputName]: fairFaceInputTensor(crop) }),
+         RACE_MODEL.timeoutMs,
+         'timeout inferenza modello race'
+      );
+      const raceTensor = getRaceOutputTensor(outputs, session.outputNames);
+      return fairFaceRaceMarker(tensorClassPrediction(raceTensor));
+   } catch (err) {
+      console.error(err);
+      setLog(`Modello race non disponibile: ${err.message || err}. Continuo senza bloccare la scansione.`);
+      return null;
+   }
+}
+
+async function annotateRace(result) {
+   const marker = await estimateRaceMarker(result);
+   if (marker) result.race = marker;
+   return marker;
 }
 
 function avgPoint(points) {
@@ -351,7 +610,7 @@ async function loadGhostyle(url, expectedName = null) {
    }
 }
 
-function drawDetectionScaffold(ctx, resized) {
+function drawDetectionScaffold(ctx, resized, raceMarker = null) {
    const box = resized.detection.box;
    const landmarks = resized.landmarks;
    const leftEye = landmarks.getLeftEye();
@@ -393,6 +652,7 @@ function drawDetectionScaffold(ctx, resized) {
    const lines = ['volto rilevato'];
    if (typeof resized.age === 'number') lines.push(`eta stimata: ${Math.round(resized.age)}`);
    if (resized.gender) lines.push(`genere stimato: ${resized.gender}`);
+   lines.push(`race stimata: ${formatRaceMarker(raceMarker || getRaceMarker(resized))}`);
    new faceapi.draw.DrawTextField(lines, { x: box.x, y: Math.max(16, box.y - 8) }).draw(els.overlay);
    ctx.restore();
 }
@@ -402,7 +662,7 @@ function drawEffectOverlay(result, includeDetectionScaffold = false) {
    const ctx = els.overlay.getContext('2d');
    ctx.clearRect(0, 0, els.overlay.width, els.overlay.height);
    const resized = faceapi.resizeResults(result, { width: els.overlay.width, height: els.overlay.height });
-   if (includeDetectionScaffold) drawDetectionScaffold(ctx, resized);
+   if (includeDetectionScaffold) drawDetectionScaffold(ctx, resized, getRaceMarker(result));
    if (activeEffect) {
       const style = loadedGhostyles.get(activeEffect);
       if (style && style.module.onDraw) {
@@ -416,7 +676,7 @@ function drawEffectOverlay(result, includeDetectionScaffold = false) {
    lastKnownEffectResult = result;
 }
 
-async function detectCurrentFace(drawOverlay = true) {
+async function detectCurrentFace(drawOverlay = true, includeRace = true) {
    clearOverlay();
    const result = await faceapi.detectSingleFace(els.video, DETECTOR_OPTIONS)
       .withFaceLandmarks()
@@ -429,6 +689,7 @@ async function detectCurrentFace(drawOverlay = true) {
       return null;
    }
 
+   if (includeRace) await annotateRace(result);
    if (drawOverlay) drawResult(result);
    return result;
 }
@@ -438,7 +699,7 @@ function drawResult(result) {
    const ctx = els.overlay.getContext('2d');
    ctx.clearRect(0, 0, els.overlay.width, els.overlay.height);
    const resized = faceapi.resizeResults(result, { width: els.overlay.width, height: els.overlay.height });
-   drawDetectionScaffold(ctx, resized);
+   drawDetectionScaffold(ctx, resized, getRaceMarker(result));
    if (activeEffect) {
       const style = loadedGhostyles.get(activeEffect);
       if (style && style.module.onDraw) {
@@ -559,7 +820,8 @@ async function scanFace() {
    const age = Math.round(result.age);
    const gender = result.gender || 'n/d';
    const confidence = typeof result.genderProbability === 'number' ? ` (${Math.round(result.genderProbability * 100)}%)` : '';
-   setLog(`Volto trovato. Età stimata: ${age}. Genere stimato: ${gender}${confidence}. Overlay biometrico aggiornato.`);
+   const race = formatRaceMarker(getRaceMarker(result));
+   setLog(`Volto trovato. Età stimata: ${age}. Genere stimato: ${gender}${confidence}. Race stimata: ${race}. Overlay biometrico aggiornato.`);
 }
 
 async function saveFace() {
@@ -573,6 +835,7 @@ async function saveFace() {
       descriptor: Array.from(result.descriptor),
       age: Math.round(result.age),
       gender: result.gender || null,
+      race: getRaceMarker(result),
       savedAt: new Date().toISOString()
    });
    persistDb();
@@ -650,7 +913,7 @@ function handleError(err, fallbackMessage) {
 }
 
 async function testMakeupEfficacy() {
-   const result = await detectCurrentFace(false);
+   const result = await detectCurrentFace(false, false);
    if (!result) {
       setLog('Nessun volto di base trovato. Avvicinati alla webcam.');
       return;
@@ -815,6 +1078,8 @@ async function init() {
    try {
       await loadModels();
       await startCamera();
+      setLog('Precaricamento YOLOv8n FairFace race/ethnicity avviato in background.');
+      preloadRaceSession();
 
       try {
          const ghostylistRes = await fetch('ghostylist.json');
